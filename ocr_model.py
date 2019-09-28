@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.autograd import Variable
 import numpy as np
+import tqdm
 
 from data import make_ocr_data_batch
 
@@ -21,70 +22,61 @@ else:
         x = Variable(torch.from_numpy(x).type(tor_type), requires_grad = req)
         return x
 
-class Encoder(nn.Module):
-    def __init__(self, hidden_size):
-        super(Encoder, self).__init__()
-        self.hidden_size = hidden_size
+# return result mod 10
+class OCR(nn.Module):
+    def __init__(self):
+        super(OCR, self).__init__()
         self.conv1 = nn.Conv2d(1, 20, 5)
         self.conv2 = nn.Conv2d(20, 20, 5)
-        self.fc1 = nn.Linear(400, 100)
+        self.fc1 = nn.Linear(400, 400)
+        self.pred = nn.Linear(400, 10)
+        self.opt = torch.optim.Adam(self.parameters(), lr=0.001)
 
     def forward(self, x):
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
+        # compute mean over the "x-axis" feature maps and collapse
         x = torch.mean(x, dim=-1)
         x = x.reshape(-1,20*20)
         x = F.relu(self.fc1(x))
+        x = F.log_softmax(self.pred(x), dim=1)
         return x
+    
+    def learn_once(self, X, Y):
+        X = to_torch(X, "float").unsqueeze(1)
+        Y = to_torch(Y, "int")
+        # optimize 
+        self.opt.zero_grad()
+        output = self(X)
+        loss = F.nll_loss(output, Y)
+        loss.backward()
+        self.opt.step()
+        return loss
 
-class DecoderRNN(nn.Module):
-    def __init__(self, hidden_size, word_size):
-        super(DecoderRNN, self).__init__()
-        self.hidden_size = hidden_size
-        self.word_size = word_size
-        # takes in word, takes in hidden, get new hidden
-        self.step = nn.Linear(word_size+hidden_size, hidden_size)
-        # take the new hidden, compute the out from it
-        self.dec_out = nn.Linear(hidden_size, word_size)
+    def save(self, loc):
+        torch.save(self.state_dict(), loc)
 
-    def forward(self, word, hidden):
-        hid = F.sigmoid(self.step(torch.cat((word, hidden), dim=1)))
-        out = F.softmax(self.dec_out(hid), dim=1)
-        return out, hid
+    def load(self, loc):
+        self.load_state_dict(torch.load(loc))
 
-    def roll_out(self, hidden, num_rolls):
-        cur_word = torch.zeros(hidden.size()[0], self.word_size).cuda()
-        ret = []
-        for i in range(num_rolls):
-            cur_word, hidden = self(cur_word, hidden)
-            ret.append(cur_word)
-        return ret
-
-class OCR:
-    def __init__(self, encoder, decoder):
-        self.enc = encoder
-        self.dec = decoder
-
-    def learn(self, img_batch, seq_batch):
-        raise NotImplementedError
-
-    def transcribe(self, img):
-        x_enc = self.enc(img)
-        seq_dec = self.dec.roll_out(x_enc, 13)
-        ret = []
-        for tstep in seq_dec:
-            amax = np.argmax(tstep.detach().cpu().numpy(), axis=1)
-            ret.append(amax)
-        return ret
+def evaluate(ocr):
+    for seq_l in range(1, 5):
+        acc = 0
+        for bb in range(100):
+            X, Y = make_ocr_data_batch(seq_l)
+            Y_pred = np.argmax(ocr(to_torch(X,"float").unsqueeze(1)).detach().cpu().numpy(), axis=1)
+            acc += np.mean(Y_pred == Y)
+        print (f"seq length {seq_l} accuracy {acc / 100}")
 
 
 if __name__ == '__main__':
-    X1, Y1 = make_ocr_data_batch(7, 2)
-    
-    enc = Encoder(100).cuda()
-    dec = DecoderRNN(100, 10).cuda()
-    ocr = OCR(enc, dec)
+    ocr = OCR().cuda()
+    for i in tqdm.tqdm(range(10000000)):
+        seq_l = np.random.randint(1, 4)
+        X, Y = make_ocr_data_batch(seq_l)
+        loss = ocr.learn_once(X, Y)
+        if i % 10000 == 0:
+            ocr.save('ocr_model.mdl')
+            evaluate(ocr)
 
-    seq_outputs = ocr.transcribe(to_torch(X1,"float").unsqueeze(1))
-    print (seq_outputs)
 
